@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import random
+import urllib.parse
 import requests
 from flask import Flask, render_template_string, request, send_from_directory, jsonify, redirect
 from flask_socketio import SocketIO, emit
@@ -21,6 +22,27 @@ state = {
     'last_update': time.time()
 }
 
+def get_current_state():
+    current_ts = state['timestamp']
+    if state['is_playing'] and state['current_index'] >= 0:
+        current_ts += (time.time() - state['last_update'])
+    return {
+        'playlist': state['playlist'],
+        'current_index': state['current_index'],
+        'is_playing': state['is_playing'],
+        'timestamp': current_ts
+    }
+
+def broadcast_state():
+    socketio.emit('state_update', get_current_state())
+
+def parse_filename(filename):
+    name = os.path.splitext(filename)[0]
+    if ' - ' in name:
+        parts = name.split(' - ', 1)
+        return parts[1].strip(), parts[0].strip()
+    return name.strip(), 'Неизвестный исполнитель'
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -34,7 +56,7 @@ HTML_PAGE = """<!DOCTYPE html>
         .card { background: #1e1e1e; padding: 16px; border-radius: 12px; margin-bottom: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
         .row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
         .row:last-child { margin-bottom: 0; }
-        input[type="text"], input[type="file"] { flex: 1; background: #2a2a2a; border: 1px solid #333; color: #fff; padding: 10px; border-radius: 8px; font-size: 14px; }
+        input[type="text"], input[type="file"] { flex: 1; background: #2a2a2a; border: 1px solid #333; color: #fff; padding: 10px; border-radius: 8px; font-size: 14px; min-width: 0; }
         button { background: #1db954; color: #fff; border: none; padding: 10px 14px; border-radius: 8px; font-weight: bold; cursor: pointer; white-space: nowrap; transition: 0.2s; }
         button:hover { background: #1ed760; }
         button:disabled { background: #555; cursor: not-allowed; }
@@ -49,7 +71,7 @@ HTML_PAGE = """<!DOCTYPE html>
         #nowArtist { font-size: 14px; color: #b3b3b3; margin-top: 4px; }
         
         audio { width: 100%; margin-bottom: 12px; }
-        .controls { display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; }
+        .controls { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; }
         .hint { font-size: 12px; color: #888; text-align: center; margin-top: 10px; }
         
         .playlist-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 14px; color: #aaa; }
@@ -69,7 +91,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="card">
         <div class="row">
             <input type="text" id="ydiskUrl" placeholder="Ссылка на публичную папку или файл Яндекс.Диска">
-            <button id="ydiskBtn" onclick="importYdisk()">Добавить с Диска</button>
+            <button id="ydiskBtn" onclick="importYdisk()">С Диска</button>
         </div>
         <div class="row">
             <input type="file" id="fileInput" accept="audio/*" multiple>
@@ -81,12 +103,12 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="card">
         <div class="now-playing-box">
             <div id="nowTitle">Плейлист пуст</div>
-            <div id="nowArtist">Вставьте ссылку на папку Яндекс.Диска с музыкой</div>
+            <div id="nowArtist">Добавьте музыку с устройства или Яндекс.Диска</div>
         </div>
         <audio id="player" controls playsinline></audio>
         <div class="controls">
             <button class="btn-sec" onclick="socket.emit('prev_track')">⏮ Назад</button>
-            <button class="btn-sec" onclick="socket.emit('request_sync')">🔄 Синхронизировать</button>
+            <button class="btn-sec" onclick="socket.emit('request_sync')">🔄 Синхр.</button>
             <button class="btn-sec" onclick="socket.emit('next_track')">Вперед ⏭</button>
             <button class="btn-shuffle" onclick="socket.emit('shuffle_playlist')">🔀 Перемешать</button>
         </div>
@@ -111,7 +133,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         let currentState = { playlist: [], current_index: -1 };
         let currentTrackId = null;
-        let isRemoteAction = false;
+        let ignoreEvents = false;
 
         async function importYdisk() {
             const input = document.getElementById('ydiskUrl');
@@ -194,21 +216,3 @@ HTML_PAGE = """<!DOCTYPE html>
                     socket.emit('delete_track', index);
                 };
 
-                li.appendChild(infoDiv);
-                li.appendChild(delBtn);
-                playlistEl.appendChild(li);
-            });
-        }
-
-        socket.on('state_update', (state) => {
-            currentState = state;
-            renderPlaylist();
-            
-            if (state.current_index >= 0 && state.playlist[state.current_index]) {
-                const track = state.playlist[state.current_index];
-                nowTitleEl.textContent = '▶ ' + track.title;
-                nowArtistEl.textContent = track.artist;
-                
-                if (currentTrackId !== track.id) {
-                    currentTrackId = track.id;
-                    isRemoteAction = true;
