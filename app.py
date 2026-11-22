@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 import random
+import mimetypes
 import urllib.parse
 
 import requests
@@ -34,6 +35,8 @@ state = {
     'timestamp': 0.0,
     'last_update': time.time()
 }
+
+href_cache = {}  # (public_url, path) -> (href, time)
 
 
 def get_current_state():
@@ -78,6 +81,109 @@ def remove_local_file(track):
                 pass
 
 
+# ---------------- Яндекс.Диск ----------------
+
+def is_audio(meta):
+    name = (meta.get('name') or '').lower()
+    return name.endswith(AUDIO_EXTS) or meta.get('media_type') == 'audio'
+
+
+def list_ydisk_audio(public_url, path=None, depth=0):
+    """Возвращает список (имя_файла, path) всех аудио по публичной ссылке,
+    с постраничной загрузкой и заходом в подпапки."""
+    items = []
+    offset = 0
+    while True:
+        params = {
+            'public_key': public_url,
+            'limit': 200,
+            'offset': offset,
+            'sort': 'name'
+        }
+        if path:
+            params['path'] = path
+        res = requests.get(YDISK_API, params=params, timeout=20)
+        if res.status_code != 200:
+            raise RuntimeError(f'Яндекс.Диск вернул код {res.status_code}')
+        meta = res.json()
+
+        if meta.get('type') == 'file':
+            if is_audio(meta):
+                items.append((meta.get('name', 'Трек.mp3'), path))
+            return items
+
+        emb = meta.get('_embedded', {})
+        for it in emb.get('items', []):
+            if it.get('type') == 'file' and is_audio(it):
+                items.append((it.get('name', ''), it.get('path')))
+            elif it.get('type') == 'dir' and depth < 3:
+                items.extend(list_ydisk_audio(public_url, it.get('path'), depth + 1))
+
+        total = emb.get('total', 0)
+        offset += emb.get('limit', 200)
+        if offset >= total:
+            break
+    return items
+
+
+def add_ydisk_tracks(public_url, autoplay=True):
+    """Добавляет треки с Диска в плейлист (без дубликатов). Возвращает число новых."""
+    items = list_ydisk_audio(public_url)
+    existing = {t.get('key') for t in state['playlist']}
+    encoded_url = urllib.parse.quote(public_url, safe='')
+    added = 0
+
+    for name, path in items:
+        key = f"{public_url}|{path or ''}"
+        if key in existing:
+            continue
+        existing.add(key)
+        title, artist = parse_filename(name)
+        stream_url = f"/ydisk_stream?url={encoded_url}"
+        if path:
+            stream_url += f"&path={urllib.parse.quote(path, safe='')}"
+        state['playlist'].append({
+            'id': uuid.uuid4().hex,
+            'key': key,
+            'title': title,
+            'artist': artist,
+            'url': stream_url
+        })
+        added += 1
+
+    if added and state['current_index'] == -1:
+        if autoplay:
+            start_track(0)
+        else:
+            state['current_index'] = 0
+            state['timestamp'] = 0.0
+            state['is_playing'] = False
+            state['last_update'] = time.time()
+    if added:
+        broadcast_state()
+    return added
+
+
+def get_ydisk_href(public_url, path, force=False):
+    key = (public_url, path or '')
+    cached = href_cache.get(key)
+    if cached and not force and time.time() - cached[1] < 600:
+        return cached[0]
+    params = {'public_key': public_url}
+    if path:
+        params['path'] = path
+    res = requests.get(YDISK_DOWNLOAD_API, params=params, timeout=10)
+    if res.status_code != 200:
+        raise RuntimeError(f'Yandex API error: {res.status_code}')
+    href = res.json().get('href')
+    if not href:
+        raise RuntimeError('No download link')
+    if len(href_cache) > 2000:
+        href_cache.clear()
+    href_cache[key] = (href, time.time())
+    return href
+
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -111,7 +217,8 @@ HTML_PAGE = """<!DOCTYPE html>
         .hint { font-size: 12px; color: #888; text-align: center; margin-top: 10px; }
 
         .playlist-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 14px; color: #aaa; }
-        .playlist { list-style: none; padding: 0; margin: 0; max-height: 450px; overflow-y: auto; }
+        #filterInput { width: 100%; margin-bottom: 10px; background: #2a2a2a; border: 1px solid #333; color: #fff; padding: 10px; border-radius: 8px; font-size: 14px; }
+        .playlist { list-style: none; padding: 0; margin: 0; max-height: 450px; overflow-y: auto; position: relative; }
         .track { display: flex; justify-content: space-between; align-items: center; background: #1e1e1e; padding: 10px 12px; margin-bottom: 6px; border-radius: 8px; border-left: 4px solid transparent; }
         .track:hover { background: #252525; }
         .track.active { border-left-color: #1db954; background: #282828; }
@@ -155,6 +262,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <span id="trackCount">Треков в очереди: 0</span>
         <button class="btn-del" onclick="if(confirm('Очистить весь плейлист?')) socket.emit('clear_playlist')">Очистить всё</button>
     </div>
+    <input type="text" id="filterInput" placeholder="🔍 Поиск по названию или исполнителю" oninput="applyFilter()">
     <ul class="playlist" id="playlist"></ul>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
@@ -166,12 +274,15 @@ HTML_PAGE = """<!DOCTYPE html>
         const nowArtistEl = document.getElementById('nowArtist');
         const trackCountEl = document.getElementById('trackCount');
         const statusEl = document.getElementById('status');
+        const filterEl = document.getElementById('filterInput');
 
         let currentState = { playlist: [], current_index: -1 };
         let currentTrackId = null;
         let ignoreEvents = false;
         let ignoreTimer = null;
         let pendingSeek = null;
+        let lastRenderKey = '';
+        let lastActiveIndex = -2;
 
         function muteEvents(ms) {
             ignoreEvents = true;
@@ -198,6 +309,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.error || 'Ошибка импорта');
                 input.value = '';
+                if (data.added === 0) alert('Все треки по этой ссылке уже в плейлисте');
             } catch (e) {
                 alert(e.message);
             } finally {
@@ -229,13 +341,26 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
+        function applyFilter() {
+            const q = filterEl.value.trim().toLowerCase();
+            for (const li of playlistEl.children) {
+                li.style.display = (!q || li.dataset.search.includes(q)) ? '' : 'none';
+            }
+        }
+
         function renderPlaylist() {
-            playlistEl.innerHTML = '';
+            const key = currentState.playlist.map(t => t.id).join(',') + '|' + currentState.current_index;
             trackCountEl.textContent = `Треков в очереди: ${currentState.playlist.length}`;
+            if (key === lastRenderKey) return;
+            lastRenderKey = key;
+
+            const prevScroll = playlistEl.scrollTop;
+            const frag = document.createDocumentFragment();
 
             currentState.playlist.forEach((track, index) => {
                 const li = document.createElement('li');
                 li.className = 'track' + (index === currentState.current_index ? ' active' : '');
+                li.dataset.search = (track.title + ' ' + track.artist).toLowerCase();
 
                 const infoDiv = document.createElement('div');
                 infoDiv.className = 'track-info';
@@ -262,8 +387,19 @@ HTML_PAGE = """<!DOCTYPE html>
 
                 li.appendChild(infoDiv);
                 li.appendChild(delBtn);
-                playlistEl.appendChild(li);
+                frag.appendChild(li);
             });
+
+            playlistEl.innerHTML = '';
+            playlistEl.appendChild(frag);
+            playlistEl.scrollTop = prevScroll;
+
+            if (currentState.current_index !== lastActiveIndex) {
+                lastActiveIndex = currentState.current_index;
+                const active = playlistEl.querySelector('.track.active');
+                if (active) playlistEl.scrollTop = Math.max(0, active.offsetTop - 60);
+            }
+            applyFilter();
         }
 
         socket.on('state_update', (newState) => {
@@ -332,12 +468,14 @@ HTML_PAGE = """<!DOCTYPE html>
                 socket.emit('seek', { timestamp: player.currentTime });
             }
         });
-        // Отправляем id трека, чтобы сервер переключил его только ОДИН раз,
-        // даже если "закончился" он у всех друзей одновременно
         player.addEventListener('ended', () => {
             if (currentTrackId) {
                 socket.emit('track_ended', { id: currentTrackId });
             }
+        });
+        // Если трек не загрузился — просто сообщаем в заголовке
+        player.addEventListener('error', () => {
+            if (currentTrackId) nowArtistEl.textContent = '⚠ Не удалось загрузить трек. Попробуйте «Синхр.» или другой трек';
         });
 
         // Периодическая подстройка, если у кого-то съехало время
@@ -345,7 +483,7 @@ HTML_PAGE = """<!DOCTYPE html>
             if (currentState.is_playing && !document.hidden) {
                 socket.emit('request_sync');
             }
-        }, 15000);
+        }, 20000);
 
         socket.on('connect', () => socket.emit('request_sync'));
     </script>
@@ -357,6 +495,11 @@ HTML_PAGE = """<!DOCTYPE html>
 @app.route('/')
 def index():
     return Response(HTML_PAGE, mimetype='text/html')
+
+
+@app.route('/health')
+def health():
+    return 'ok'
 
 
 @app.route('/uploads/<path:filename>')
@@ -399,54 +542,16 @@ def import_ydisk():
     public_url = data.get('url', '').strip()
     if not public_url:
         return jsonify({'error': 'Укажите ссылку'}), 400
-
     try:
-        res = requests.get(
-            YDISK_API,
-            params={'public_key': public_url, 'limit': 1000},
-            timeout=15
-        )
-        if res.status_code != 200:
-            return jsonify({
-                'error': 'Не удалось получить доступ к Яндекс.Диску. Убедитесь, что ссылка публичная.'
-            }), 400
-        meta = res.json()
-    except Exception:
-        return jsonify({'error': 'Ошибка соединения с Яндекс.Диском'}), 500
-
-    items_to_add = []
-    if meta.get('type') == 'file':
-        name = meta.get('name', 'Трек.mp3')
-        if name.lower().endswith(AUDIO_EXTS) or meta.get('media_type') == 'audio':
-            items_to_add.append((name, None))
-    elif meta.get('type') == 'dir':
-        embedded = meta.get('_embedded', {}).get('items', [])
-        for item in embedded:
-            if item.get('type') == 'file':
-                name = item.get('name', '')
-                if name.lower().endswith(AUDIO_EXTS) or item.get('media_type') == 'audio':
-                    items_to_add.append((name, item.get('path')))
-
-    if not items_to_add:
+        added = add_ydisk_tracks(public_url, autoplay=True)
+    except Exception as e:
+        return jsonify({
+            'error': f'Не удалось получить доступ к Яндекс.Диску ({e}). '
+                     f'Убедитесь, что ссылка публичная.'
+        }), 400
+    if added == 0 and not state['playlist']:
         return jsonify({'error': 'По ссылке не найдено аудиофайлов'}), 400
-
-    for name, path in items_to_add:
-        title, artist = parse_filename(name)
-        encoded_url = urllib.parse.quote(public_url, safe='')
-        stream_url = f"/ydisk_stream?url={encoded_url}"
-        if path:
-            stream_url += f"&path={urllib.parse.quote(path, safe='')}"
-        state['playlist'].append({
-            'id': uuid.uuid4().hex,
-            'title': title,
-            'artist': artist,
-            'url': stream_url
-        })
-
-    if state['current_index'] == -1 and state['playlist']:
-        start_track(0)
-    broadcast_state()
-    return jsonify({'status': 'ok', 'added': len(items_to_add)})
+    return jsonify({'status': 'ok', 'added': added})
 
 
 @app.route('/ydisk_stream')
@@ -455,18 +560,44 @@ def ydisk_stream():
     path = request.args.get('path')
     if not public_url:
         return "Missing URL", 400
-    params = {'public_key': public_url}
-    if path:
-        params['path'] = path
-    try:
-        res = requests.get(YDISK_DOWNLOAD_API, params=params, timeout=10)
-        if res.status_code == 200:
-            href = res.json().get('href')
-            if href:
-                return redirect(href)
-    except Exception:
-        pass
-    return "Failed to get stream", 502
+
+    req_headers = {}
+    if request.headers.get('Range'):
+        req_headers['Range'] = request.headers['Range']
+
+    upstream = None
+    last_error = 'unknown'
+    for force in (False, True):
+        try:
+            href = get_ydisk_href(public_url, path, force=force)
+            upstream = requests.get(href, headers=req_headers, stream=True, timeout=20)
+            if upstream.status_code < 400:
+                break
+            last_error = f'upstream status {upstream.status_code}'
+            upstream.close()
+            upstream = None
+        except Exception as e:
+            last_error = str(e)
+            upstream = None
+
+    if upstream is None:
+        return f"Stream error: {last_error}", 502
+
+    guessed = mimetypes.guess_type(path or '')[0] or 'audio/mpeg'
+    headers = {'Content-Type': guessed, 'Accept-Ranges': 'bytes'}
+    for h in ('Content-Length', 'Content-Range'):
+        if h in upstream.headers:
+            headers[h] = upstream.headers[h]
+
+    def generate():
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return Response(generate(), status=upstream.status_code, headers=headers)
 
 
 # ---------------- Socket.IO события ----------------
@@ -539,8 +670,6 @@ def handle_prev_track():
 
 @socketio.on('track_ended')
 def handle_track_ended(data=None):
-    """Переключаем трек только если сообщение пришло про текущий трек
-    (иначе при нескольких слушателях трек перескакивал бы несколько раз)."""
     if not state['playlist'] or state['current_index'] < 0 or not data:
         return
     current = state['playlist'][state['current_index']]
@@ -580,7 +709,6 @@ def handle_delete_track(index):
     elif index < state['current_index']:
         state['current_index'] -= 1
     elif index == state['current_index']:
-        # удалили играющий трек — начинаем следующий
         if state['current_index'] >= len(state['playlist']):
             state['current_index'] = 0
         state['timestamp'] = 0.0
@@ -598,6 +726,23 @@ def handle_clear_playlist():
     state['timestamp'] = 0.0
     state['last_update'] = time.time()
     broadcast_state()
+
+
+# ---------------- Автозагрузка плейлиста при старте ----------------
+
+def autoload_from_env():
+    raw = os.environ.get('YDISK_URL', '')
+    urls = [u for u in raw.replace(',', ' ').split() if u]
+    for u in urls:
+        try:
+            n = add_ydisk_tracks(u, autoplay=False)
+            print(f'[autoload] {u}: добавлено {n} треков', flush=True)
+        except Exception as e:
+            print(f'[autoload] ошибка для {u}: {e}', flush=True)
+
+
+if os.environ.get('YDISK_URL'):
+    socketio.start_background_task(autoload_from_env)
 
 
 if __name__ == '__main__':
