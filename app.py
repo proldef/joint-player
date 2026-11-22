@@ -6,14 +6,13 @@ from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Лимит 100 МБ на загрузку
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
-# Состояние комнаты
 state = {
-    'playlist': [],       # Список словарей: {'id': str, 'name': str, 'filename': str}
+    'playlist': [],
     'current_index': -1,
     'is_playing': False,
     'timestamp': 0.0,
@@ -273,7 +272,6 @@ HTML_PAGE = """
             socket.emit('next_track');
         };
 
-        // Не даем бесплатному серверу уснуть, пока открыта вкладка
         setInterval(() => {
             fetch('/ping').catch(() => {});
         }, 240000);
@@ -285,3 +283,11 @@ HTML_PAGE = """
 def get_current_payload():
     current_time = state['timestamp']
     if state['is_playing']:
+        current_time += (time.time() - state['last_update'])
+    return {
+        'playlist': state['playlist'],
+        'current_index': state['current_index'],
+        'is_playing': state['is_playing'],
+        'timestamp': current_time
+    }
+
