@@ -403,7 +403,7 @@ def import_ydisk():
     try:
         res = requests.get(
             YDISK_API,
-            params={'public_key': public_url, 'limit': 200},
+            params={'public_key': public_url, 'limit': 1000},
             timeout=15
         )
         if res.status_code != 200:
