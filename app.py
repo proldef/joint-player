@@ -1,9 +1,6 @@
 import os
 import time
 import uuid
-import eventlet
-eventlet.monkey_patch()
-
 from flask import Flask, render_template_string, request, send_from_directory, jsonify
 from flask_socketio import SocketIO, emit
 
@@ -12,7 +9,7 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Лимит 100 МБ на загрузку
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 # Состояние комнаты
 state = {
@@ -164,7 +161,6 @@ HTML_PAGE = """
         let currentTrackId = null;
         let isRemoteAction = false;
 
-        // Загрузка файлов с индикацией
         async function uploadFiles() {
             const input = document.getElementById('fileInput');
             if (!input.files.length) return;
@@ -277,7 +273,7 @@ HTML_PAGE = """
             socket.emit('next_track');
         };
 
-        // Не даем бесплатному серверу уснуть, пока открыта вкладка (пинг каждые 4 минуты)
+        // Не даем бесплатному серверу уснуть, пока открыта вкладка
         setInterval(() => {
             fetch('/ping').catch(() => {});
         }, 240000);
@@ -288,3 +284,4 @@ HTML_PAGE = """
 
 def get_current_payload():
     current_time = state['timestamp']
+    if state['is_playing']:
