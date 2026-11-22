@@ -1,6 +1,5 @@
-flask
-flask-socketio
-gunicorn
-gevent
-gevent-websocket
-packaging
+  Flask
+  flask-socketio
+  gevent
+  gevent-websocket
+  gunicorn
