@@ -4,3 +4,5 @@ gevent
 gevent-websocket
 gunicorn
 requests
+packaging
+setuptools
